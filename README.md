@@ -62,6 +62,74 @@ evo-skills/
 - **零依赖**：scheduler 纯 Python 标准库实现，自带 YAML 解析器和 cron 解析器
 - **跨平台**：支持 macOS (launchd) 和 Linux (systemd)
 
+## 用例：创建一个家庭医生角色
+
+以下演示如何用 evo-skill-creator 创建一个自我进化的"家庭医生"智能体。
+
+### 第一步：用一句话创建角色
+
+在 Claude Code 中执行：
+
+```
+/evo-skill-creator go 帮我创建一个家庭医生的角色
+```
+
+evo-skill-creator 会和你对话，确认角色定位、目标、核心能力等，然后自动生成完整的 skill 目录。
+
+### 第二步：查看生成的结果
+
+创建完成后，你会在 `~/.claude/skills/family-doctor/` 下得到：
+
+```
+family-doctor/
+├── SKILL.md                      # 角色指令（AI 读取的核心文件）
+├── .claude/settings.local.json   # 权限配置
+├── references/                   # 参考资料
+│   └── evo-agent-model.md        # 自进化模型蓝图
+└── memory/                       # 记忆系统
+    ├── scene-index.md            # 场景索引（按需加载，避免上下文爆炸）
+    ├── learning-plan.md          # 学习计划（自动更新）
+    ├── knowledge/                # 知识库（learn/scan 自动积累）
+    ├── scenario-sops/            # 各命令的 SOP
+    └── private/                  # 个人数据（健康档案等）
+```
+
+### 第三步：使用你的家庭医生
+
+```
+# 健康咨询
+/family-doctor go 最近总是头疼，怎么回事
+
+# 让它自主学习最新医学知识
+/family-doctor learn 学习一下偏头痛的最新治疗方法
+
+# 查看它学了什么
+/family-doctor status
+```
+
+### 第四步：配置自动进化
+
+将 `scheduler/configs/example.yaml` 复制为 `family-doctor.yaml`，配置定时任务：
+
+```yaml
+agent:
+  name: family-doctor
+  executor: claude
+
+schedules:
+  - command: learn
+    cron: "0 14 * * *"
+    description: "每天下午深度学习"
+  - command: scan
+    cron: "0 10 * * *"
+    description: "每天上午扫描医学动态"
+  - command: review
+    cron: "0 17 * * 5"
+    description: "每周五自省评审"
+```
+
+之后 scheduler 会在后台自动唤醒家庭医生执行学习、扫描和自省，知识库持续增长，越用越强。
+
 ## 支持的执行后端
 
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (Anthropic)
