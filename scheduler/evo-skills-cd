@@ -1,0 +1,268 @@
+#!/usr/bin/env python3
+"""
+evo-skills-cd — 快速跳转到 evo-skills 角色目录
+
+用法：
+  eval "$(evo-skills-cd --setup-shell)"    添加到 .zshrc/.bashrc，注入 shell 函数和 Tab 补全
+  evo-skills-cd <role>                      cd 到角色目录
+  evo-skills-cd --list                      列出所有已注册角色
+  evo-skills-cd --config                    显示当前配置
+  evo-skills-cd --set-base-dir <path>       设置基础目录
+
+配置：
+  base_dir 默认为 ~/.claude/skills
+  可通过以下方式覆盖（优先级从高到低）：
+    1. EVO_SKILLS_BASE_DIR 环境变量
+    2. evo-skills-cd.conf 配置文件
+    3. 默认值 ~/.claude/skills
+
+角色发现：
+  从 scheduler/configs/ 目录中的 .yaml / .yaml.disabled 文件发现已注册角色。
+  仅通过 evo-skill-creator 创建并纳管的角色才会出现在补全列表中。
+"""
+
+import os
+import sys
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# 路径推断
+# ---------------------------------------------------------------------------
+SCRIPT_DIR = Path(os.path.realpath(__file__)).parent
+CONFIGS_DIR = SCRIPT_DIR / "configs"
+CONFIG_FILE = SCRIPT_DIR / "evo-skills-cd.conf"
+DEFAULT_BASE_DIR = "~/.claude/skills"
+
+
+# ---------------------------------------------------------------------------
+# 配置管理
+# ---------------------------------------------------------------------------
+
+def load_config() -> dict:
+    """加载配置文件，返回 {key: value}。"""
+    config = {}
+    if CONFIG_FILE.exists():
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" in line:
+                    key, _, val = line.partition("=")
+                    config[key.strip()] = val.strip()
+    return config
+
+
+def get_base_dir() -> str:
+    """获取基础目录，按优先级：环境变量 > 配置文件 > 默认值。"""
+    env_val = os.environ.get("EVO_SKILLS_BASE_DIR")
+    if env_val:
+        return os.path.expanduser(env_val)
+
+    config = load_config()
+    if "base_dir" in config:
+        return os.path.expanduser(config["base_dir"])
+
+    return os.path.expanduser(DEFAULT_BASE_DIR)
+
+
+def save_base_dir(path: str):
+    """保存 base_dir 到配置文件（保留其他配置项）。"""
+    config = load_config()
+    config["base_dir"] = path
+
+    lines = [f"# evo-skills-cd 配置文件\n"]
+    for key, val in config.items():
+        lines.append(f"{key}={val}\n")
+
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        f.writelines(lines)
+
+
+# ---------------------------------------------------------------------------
+# 角色发现
+# ---------------------------------------------------------------------------
+
+def discover_roles() -> list:
+    """从 configs/ 目录发现已注册角色名称，返回排序后的列表。"""
+    roles = set()
+    if not CONFIGS_DIR.exists():
+        return []
+
+    for f in CONFIGS_DIR.iterdir():
+        name = f.name
+        # 跳过非 yaml 文件和示例
+        if name == "example.yaml":
+            continue
+
+        # 去掉后缀：.yaml, .yml, .yaml.disabled, .yml.disabled
+        if name.endswith(".yaml.disabled"):
+            role = name[: -len(".yaml.disabled")]
+        elif name.endswith(".yml.disabled"):
+            role = name[: -len(".yml.disabled")]
+        elif name.endswith(".yaml"):
+            role = name[: -len(".yaml")]
+        elif name.endswith(".yml"):
+            role = name[: -len(".yml")]
+        else:
+            continue
+
+        roles.add(role)
+
+    return sorted(roles)
+
+
+def get_role_dir(role: str) -> str:
+    """获取角色的完整目录路径。"""
+    base = get_base_dir()
+    return os.path.join(base, role)
+
+
+# ---------------------------------------------------------------------------
+# Shell 集成代码生成
+# ---------------------------------------------------------------------------
+
+def generate_shell_setup() -> str:
+    """生成 shell 函数和 Tab 补全代码（兼容 bash 和 zsh）。"""
+    script_path = os.path.realpath(__file__)
+
+    return f'''# evo-skills-cd shell integration
+# 由 evo-skills-cd --setup-shell 生成，请勿手动编辑
+# 添加到 ~/.zshrc 或 ~/.bashrc: eval "$(evo-skills-cd --setup-shell)"
+
+evo-skills-cd() {{
+    if [ $# -eq 0 ] || [[ "$1" == --* ]]; then
+        # 无参数或选项参数，直接调用 Python 脚本显示输出
+        "{script_path}" "$@"
+        return $?
+    fi
+
+    # 有角色名参数，获取目标目录
+    local target
+    target="$("{script_path}" "$@")"
+    local rc=$?
+
+    if [ $rc -ne 0 ]; then
+        echo "$target" >&2
+        return $rc
+    fi
+
+    if [ -d "$target" ]; then
+        cd "$target" || return 1
+        echo "$target"
+    else
+        echo "目录不存在: $target" >&2
+        echo "提示: 请确认角色 '$1' 的目录已创建" >&2
+        return 1
+    fi
+}}
+
+# Tab 补全
+_evo_skills_cd_completions() {{
+    local roles
+    roles="$("{script_path}" --list 2>/dev/null)"
+
+    if [ -n "$ZSH_VERSION" ]; then
+        # zsh
+        local -a role_array
+        role_array=(${{(f)roles}})
+        compadd -a role_array
+    else
+        # bash
+        local cur="${{COMP_WORDS[COMP_CWORD]}}"
+        COMPREPLY=($(compgen -W "$roles" -- "$cur"))
+    fi
+}}
+
+if [ -n "$ZSH_VERSION" ] && type compdef &>/dev/null; then
+    compdef _evo_skills_cd_completions evo-skills-cd
+elif [ -n "$BASH_VERSION" ]; then
+    complete -F _evo_skills_cd_completions evo-skills-cd
+fi
+'''
+
+
+# ---------------------------------------------------------------------------
+# 命令入口
+# ---------------------------------------------------------------------------
+
+def print_usage():
+    print("evo-skills-cd — 快速跳转到 evo-skills 角色目录")
+    print()
+    print("用法：")
+    print('  eval "$(evo-skills-cd --setup-shell)"    注入 shell 函数和 Tab 补全')
+    print("  evo-skills-cd <role>                      cd 到角色目录")
+    print("  evo-skills-cd --list                      列出所有已注册角色")
+    print("  evo-skills-cd --config                    显示当前配置")
+    print("  evo-skills-cd --set-base-dir <path>       设置基础目录")
+    print()
+    print("已注册角色：")
+    roles = discover_roles()
+    if roles:
+        for r in roles:
+            d = get_role_dir(r)
+            exists = "  " if os.path.isdir(d) else "? "
+            print(f"  {exists}{r}")
+        print()
+        print("  (? = 目录不存在)")
+    else:
+        print("  (无)")
+    print()
+    print(f"基础目录: {get_base_dir()}")
+
+
+def main():
+    args = sys.argv[1:]
+
+    if not args or args[0] in ("-h", "--help", "help"):
+        print_usage()
+        sys.exit(0)
+
+    cmd = args[0]
+
+    if cmd == "--setup-shell":
+        print(generate_shell_setup())
+
+    elif cmd == "--list":
+        roles = discover_roles()
+        for r in roles:
+            print(r)
+
+    elif cmd == "--config":
+        base = get_base_dir()
+        print(f"base_dir={base}")
+        print(f"configs_dir={CONFIGS_DIR}")
+        print(f"config_file={CONFIG_FILE}")
+        env = os.environ.get("EVO_SKILLS_BASE_DIR", "")
+        if env:
+            print(f"EVO_SKILLS_BASE_DIR={env} (环境变量生效)")
+
+    elif cmd == "--set-base-dir":
+        if len(args) < 2:
+            print("错误: 请指定目录路径", file=sys.stderr)
+            print('用法: evo-skills-cd --set-base-dir ~/workspace/roles', file=sys.stderr)
+            sys.exit(1)
+        new_dir = args[1]
+        expanded = os.path.expanduser(new_dir)
+        save_base_dir(new_dir)
+        print(f"基础目录已设置为: {new_dir}")
+        print(f"展开路径: {expanded}")
+        if not os.path.isdir(expanded):
+            print(f"提示: 目录 {expanded} 不存在，使用时将自动创建或需手动创建")
+
+    else:
+        # 角色名参数 — 输出目标目录路径
+        role = cmd
+        roles = discover_roles()
+        if role not in roles:
+            print(f"错误: 角色 '{role}' 未注册", file=sys.stderr)
+            if roles:
+                print(f"可用角色: {', '.join(roles)}", file=sys.stderr)
+            sys.exit(1)
+
+        target = get_role_dir(role)
+        print(target)
+
+
+if __name__ == "__main__":
+    main()

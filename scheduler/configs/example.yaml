@@ -1,0 +1,39 @@
+# 示例配置 — 复制并重命名为 <你的智能体名称>.yaml
+#
+# 用法：
+#   cp example.yaml my-agent.yaml
+#   然后修改 name、executor、add_dirs、schedules 等字段
+#
+# scheduler 会自动发现 configs/ 下的新 .yaml 文件（热加载）
+
+agent:
+  name: my-agent
+  executor: claude          # claude 或 opencode
+  model: ""                 # 留空使用默认模型，或指定如 claude-sonnet-4-6
+  permissions:
+    permission_mode: default
+    allowed_tools:
+      - WebSearch
+      - WebFetch
+      - Read
+      - Edit
+      - Write
+      - Glob
+      - Grep
+      - "Bash(python3:*)"
+    add_dirs:
+      - "~/.claude/skills/my-agent/memory"
+      - "~/.claude/skills/my-agent/output"
+
+schedules:
+  - command: learn
+    cron: "0 9 * * *"
+    description: "每天早上 9 点深度学习"
+
+  - command: scan
+    cron: "0 14 * * *"
+    description: "每天下午 2 点扫描新趋势"
+
+  - command: review
+    cron: "0 17 * * 5"
+    description: "每周五下午自省评审"

@@ -1,0 +1,1062 @@
+#!/usr/bin/env python3
+"""
+evo-skills-client — Evo Skills 调度系统客户端
+
+用法：
+  evo-skills-client status                              显示所有角色状态
+  evo-skills-client status <agent>                     显示角色唤醒清单
+  evo-skills-client status <agent> --full              显示完整输出（不截断）
+  evo-skills-client history <agent>                     列出某角色的唤醒历史
+  evo-skills-client detail <agent> <time>               显示某次唤醒的详细日志
+  evo-skills-client config <agent>                      显示某角色的调度配置
+  evo-skills-client config <agent> --set "<cmd>.<field>=<value>"  修改配置字段
+    支持字段：cron, executor, model
+"""
+
+import json
+import os
+import re
+import sys
+from datetime import datetime
+from pathlib import Path
+from urllib.request import urlopen
+from urllib.error import URLError
+
+# ---------------------------------------------------------------------------
+# 路径推断：脚本位于 scheduler/ 目录下
+# ---------------------------------------------------------------------------
+SCRIPT_DIR = Path(os.path.realpath(__file__)).parent
+SCHEDULER_DIR = SCRIPT_DIR  # 脚本本身就在 scheduler/ 下
+CONFIGS_DIR = SCHEDULER_DIR / "configs"
+LOGS_DIR = SCHEDULER_DIR / "logs"
+STATE_FILE = SCHEDULER_DIR / "state.json"
+
+
+# ===========================================================================
+# HTTP API 查询
+# ===========================================================================
+
+def query_scheduler_api(endpoint: str) -> dict:
+    """查询 scheduler HTTP API，返回 JSON 数据。
+
+    如果连接失败，返回 None（表示 scheduler 未运行或已死）。
+    """
+    # 读取 state.json 获取端口
+    if not STATE_FILE.exists():
+        return None
+
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            state = json.load(f)
+
+        http_port = state.get("http_port")
+        if not http_port:
+            return None
+
+        # 尝试连接 HTTP API
+        url = f"http://127.0.0.1:{http_port}{endpoint}"
+        with urlopen(url, timeout=2) as response:
+            data = response.read().decode("utf-8")
+            return json.loads(data)
+
+    except (URLError, OSError, json.JSONDecodeError, KeyError):
+        return None
+
+
+# ===========================================================================
+# 简易 YAML 解析器（纯标准库，与 scheduler 一致的逻辑）
+# ===========================================================================
+
+def _parse_yaml_value(raw: str):
+    """解析 YAML 值：字符串（带/不带引号）、数字、布尔、null。"""
+    val = raw.strip()
+    if not val:
+        return ""
+    # 带引号的字符串
+    if (val.startswith('"') and val.endswith('"')) or \
+       (val.startswith("'") and val.endswith("'")):
+        return val[1:-1]
+    # 布尔
+    if val.lower() in ("true", "yes"):
+        return True
+    if val.lower() in ("false", "no"):
+        return False
+    # null
+    if val.lower() in ("null", "~"):
+        return None
+    # 整数 / 浮点
+    try:
+        return int(val)
+    except ValueError:
+        pass
+    try:
+        return float(val)
+    except ValueError:
+        pass
+    return val
+
+
+def parse_yaml(text: str) -> dict:
+    """
+    极简 YAML 解析：支持嵌套映射、列表（- 开头）和注释。
+    不支持多行字符串、锚点等高级特性。
+    """
+    lines = text.splitlines()
+    return _parse_block(lines, 0, 0)[0]
+
+
+def _indent_level(line: str) -> int:
+    return len(line) - len(line.lstrip())
+
+
+def _parse_block(lines: list, start: int, base_indent: int):
+    """递归解析一个 YAML 块，返回 (result, next_line_index)。"""
+    result = {}
+    i = start
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+
+        # 跳过空行和纯注释
+        if not stripped or stripped.startswith("#"):
+            i += 1
+            continue
+
+        indent = _indent_level(line)
+
+        # 缩进回退 → 退出当前块
+        if indent < base_indent:
+            break
+
+        # 列表项
+        if stripped.startswith("- "):
+            # 收集整个列表
+            lst, i = _parse_list(lines, i, indent)
+            # 把列表挂到上层 result 中——
+            # 作为独立返回
+            return lst, i
+
+        # 键值对
+        if ":" in stripped:
+            colon_pos = stripped.index(":")
+            key = stripped[:colon_pos].strip()
+            rest = stripped[colon_pos + 1:].strip()
+
+            # 去除行尾注释（仅在值不是引号包裹时）
+            if rest and not rest.startswith('"') and not rest.startswith("'"):
+                if " #" in rest:
+                    rest = rest[:rest.index(" #")].strip()
+
+            if rest:
+                # 同行有值
+                result[key] = _parse_yaml_value(rest)
+                i += 1
+            else:
+                # 值在下面的缩进块
+                i += 1
+                if i < len(lines):
+                    next_stripped = lines[i].strip()
+                    next_indent = _indent_level(lines[i]) if next_stripped else base_indent
+                    if next_stripped and next_indent > indent:
+                        child, i = _parse_block(lines, i, next_indent)
+                        result[key] = child
+                    else:
+                        result[key] = None
+                else:
+                    result[key] = None
+        else:
+            i += 1
+
+    return result, i
+
+
+def _parse_list(lines: list, start: int, base_indent: int):
+    """解析一个 YAML 列表（以 - 开头的连续项）。"""
+    lst = []
+    i = start
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+
+        if not stripped or stripped.startswith("#"):
+            i += 1
+            continue
+
+        indent = _indent_level(line)
+        if indent < base_indent:
+            break
+
+        if indent == base_indent and stripped.startswith("- "):
+            # 列表项内容
+            item_content = stripped[2:].strip()
+            # 引号包裹的值视为简单字符串（不解析内部冒号）
+            is_quoted = (len(item_content) >= 2
+                         and item_content[0] == item_content[-1]
+                         and item_content[0] in ('"', "'"))
+            if not is_quoted and ":" in item_content:
+                # 这是一个映射列表项（如 - command: go）
+                item = {}
+                colon_pos = item_content.index(":")
+                key = item_content[:colon_pos].strip()
+                val = item_content[colon_pos + 1:].strip()
+                if val:
+                    item[key] = _parse_yaml_value(val)
+                else:
+                    item[key] = None
+                i += 1
+                # 收集同一列表项的后续键值对（缩进 > base_indent）
+                while i < len(lines):
+                    nline = lines[i]
+                    ns = nline.strip()
+                    if not ns or ns.startswith("#"):
+                        i += 1
+                        continue
+                    ni = _indent_level(nline)
+                    if ni <= base_indent:
+                        break
+                    if ":" in ns and not ns.startswith("- "):
+                        cp = ns.index(":")
+                        k = ns[:cp].strip()
+                        v = ns[cp + 1:].strip()
+                        item[k] = _parse_yaml_value(v)
+                        i += 1
+                    else:
+                        break
+                lst.append(item)
+            else:
+                # 简单值列表项
+                lst.append(_parse_yaml_value(item_content))
+                i += 1
+        elif indent > base_indent:
+            # 属于上一个列表项的续行
+            i += 1
+        else:
+            break
+
+    return lst, i
+
+
+def load_yaml_file(filepath: Path) -> dict:
+    """加载并解析一个 YAML 文件。"""
+    with open(filepath, "r", encoding="utf-8") as f:
+        text = f.read()
+    return parse_yaml(text)
+
+
+def dump_yaml_simple(data: dict, indent: int = 0) -> str:
+    """极简 YAML 序列化（仅支持本项目用到的结构）。"""
+    lines = []
+    prefix = "  " * indent
+    for key, val in data.items():
+        if isinstance(val, dict):
+            lines.append(f"{prefix}{key}:")
+            lines.append(dump_yaml_simple(val, indent + 1))
+        elif isinstance(val, list):
+            lines.append(f"{prefix}{key}:")
+            for item in val:
+                if isinstance(item, dict):
+                    first = True
+                    for k, v in item.items():
+                        if first:
+                            lines.append(f"{prefix}  - {k}: {_format_val(v)}")
+                            first = False
+                        else:
+                            lines.append(f"{prefix}    {k}: {_format_val(v)}")
+                else:
+                    lines.append(f"{prefix}  - {_format_val(item)}")
+        else:
+            lines.append(f"{prefix}{key}: {_format_val(val)}")
+    return "\n".join(lines)
+
+
+def _format_val(v) -> str:
+    if v is None:
+        return "null"
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, str):
+        # 含空格或特殊字符时加引号
+        if " " in v or any(c in v for c in ":#{}[]&*!|>'\"%@`"):
+            return f'"{v}"'
+        return v
+    return str(v)
+
+
+# ===========================================================================
+# 命令实现
+# ===========================================================================
+
+def _strip_ansi(text: str) -> str:
+    """去除 ANSI 转义序列。"""
+    return re.sub(r'\x1b\[[0-9;]*m', '', text)
+
+
+def _parse_log_header(text: str) -> dict:
+    """解析日志文件头部的元信息行，返回字典。"""
+    info = {}
+    for line in text.splitlines():
+        if line.startswith("=" * 10):
+            break
+        if ":" in line:
+            key, _, val = line.partition(":")
+            info[key.strip()] = val.strip()
+    return info
+
+
+def _extract_log_sections(text: str) -> dict:
+    """从日志中提取 STDOUT 和 STDERR 段的内容。"""
+    sections = {}
+    current = None
+    buf = []
+    separator = "=" * 60
+
+    for line in text.splitlines():
+        if line.strip() == separator:
+            if current is not None:
+                sections[current] = "\n".join(buf)
+                buf = []
+                current = None
+            continue
+        if line.strip() in ("STDOUT:", "STDERR:"):
+            current = line.strip().rstrip(":")
+            buf = []
+            continue
+        if current is not None:
+            buf.append(line)
+
+    if current is not None:
+        sections[current] = "\n".join(buf)
+
+    return sections
+
+
+def _get_log_files(agent: str) -> list:
+    """获取角色的所有日志文件，按时间倒序排列（最新的在前）。"""
+    agent_log_dir = LOGS_DIR / agent
+    if not agent_log_dir.exists():
+        return []
+    return sorted(
+        [f for f in agent_log_dir.iterdir() if f.suffix == ".log"],
+        reverse=True
+    )
+
+
+def _parse_log_brief(filepath: Path) -> dict:
+    """快速解析日志文件头部，返回摘要信息。"""
+    with open(filepath, "r", encoding="utf-8") as f:
+        raw = f.read()
+    clean = _strip_ansi(raw)
+    info = _parse_log_header(clean)
+
+    exit_code = info.get("Exit Code", "-")
+    if exit_code == "0":
+        status_str = "成功"
+    elif exit_code == "-1":
+        status_str = "超时"
+    else:
+        status_str = f"失败({exit_code})"
+
+    executor_raw = info.get("Executor", "-")
+    executor_short = Path(executor_raw).stem if executor_raw != "-" else "-"
+
+    return {
+        "command": info.get("Command", "-"),
+        "executor": executor_short,
+        "started": info.get("Started", "-"),
+        "duration": info.get("Duration", "-"),
+        "exit_code": exit_code,
+        "status": status_str,
+    }
+
+
+def _print_output_section(title, text, full, agent, index):
+    """打印输出或执行过程段，支持截断。"""
+    if not text:
+        return
+    lines = text.splitlines()
+    total = len(lines)
+    HEAD, TAIL = 100, 50
+    print(f"【{title}】（共 {total} 行）")
+    print("-" * 68)
+    if full or total <= HEAD + TAIL:
+        print(text)
+    else:
+        for line in lines[:HEAD]:
+            print(line)
+        omitted = total - HEAD - TAIL
+        print(f"\n  ... 省略 {omitted} 行（使用 --full 查看完整输出） ...\n")
+        for line in lines[-TAIL:]:
+            print(line)
+    print("-" * 68)
+
+
+def _show_log_detail(filepath: Path, agent: str, index: int, full: bool = False):
+    """显示某个日志文件的详细信息。"""
+    with open(filepath, "r", encoding="utf-8") as f:
+        raw = f.read()
+
+    clean = _strip_ansi(raw)
+    info = _parse_log_header(clean)
+    sections = _extract_log_sections(clean)
+
+    command = info.get("Command", "-")
+    cli = info.get("CLI", "-")
+    started = info.get("Started", "-")
+    ended = info.get("Ended", "-")
+    duration = info.get("Duration", "-")
+    exit_code = info.get("Exit Code", "-")
+    executor = info.get("Executor", "-")
+    cwd = info.get("CWD", "-")
+    executor_short = Path(executor).stem if executor != "-" else "-"
+
+    if exit_code == "0":
+        status_str = "成功"
+    elif exit_code == "-1":
+        status_str = "超时"
+    else:
+        status_str = f"失败 (exit {exit_code})"
+
+    # 检查是否正在运行
+    running_info = ""
+    if index == 1 and STATE_FILE.exists():
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            state_data = json.load(f)
+        agent_state = state_data.get("agents", {}).get(agent, {})
+        if agent_state.get("status") == "running":
+            running_cmd = agent_state.get("current_command", "")
+            running_since = agent_state.get("started_at", "")
+            running_info = f"  >>> 当前正在运行: /{agent} {running_cmd}（从 {running_since} 开始）"
+
+    print(f"【唤醒记录 #{index}】角色: {agent}")
+    if running_info:
+        print(running_info)
+    print(f"  命令:     /{agent} {command}")
+    print(f"  CLI:      {cli}")
+    print(f"  执行器:   {executor_short}")
+    if cwd != "-":
+        print(f"  工作目录: {cwd}")
+    print(f"  开始时间: {started}")
+    print(f"  结束时间: {ended}")
+    print(f"  耗时:     {duration}")
+    print(f"  状态:     {status_str}")
+    print(f"  日志文件: {filepath.name}")
+    print()
+
+    stdout = sections.get("STDOUT", "").strip()
+    if stdout:
+        _print_output_section("输出", stdout, full, agent, index)
+    else:
+        print("【输出】（无输出）")
+    print()
+
+    stderr = sections.get("STDERR", "").strip()
+    if stderr:
+        _print_output_section("执行过程", stderr, full, agent, index)
+
+    if not full:
+        any_truncated = (stdout and len(stdout.splitlines()) > 150) or \
+                        (stderr and len(stderr.splitlines()) > 150)
+        if any_truncated:
+            print()
+            print(f"提示：使用 evo-skills-client status {agent} {index} --full 查看完整输出")
+
+
+def cmd_status_agent(agent: str, n: int = None, full: bool = False):
+    """显示角色的唤醒记录。
+
+    n=None: 显示该角色所有唤醒记录的清单
+    n=整数: 显示倒数第 n 条记录的详情（1=最新）
+    """
+    log_files = _get_log_files(agent)
+    if not log_files:
+        print(f"【状态】角色 '{agent}' 暂无唤醒记录。")
+        agent_log_dir = LOGS_DIR / agent
+        if not agent_log_dir.exists():
+            print(f"  可能该角色尚未执行过任何任务。")
+        return
+
+    if n is not None:
+        if n < 1 or n > len(log_files):
+            print(f"【错误】角色 '{agent}' 共有 {len(log_files)} 条记录，参数 {n} 超出范围。")
+            return
+        _show_log_detail(log_files[n - 1], agent, n, full)
+    else:
+        # 显示清单
+        running_cmd = None
+        running_since = ""
+        if STATE_FILE.exists():
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                state_data = json.load(f)
+            agent_state = state_data.get("agents", {}).get(agent, {})
+            if agent_state.get("status") == "running":
+                running_cmd = agent_state.get("current_command", "?")
+                running_since = agent_state.get("started_at", "?")
+
+        print(f"【唤醒清单】角色: {agent}（共 {len(log_files)} 条记录）")
+        if running_cmd:
+            print(f"  >>> 当前正在运行: /{agent} {running_cmd}（从 {running_since} 开始）")
+        print()
+        print("=" * 84)
+        print(f"  {'#':<4} {'时间':<22} {'命令':<12} {'执行器':<10} {'耗时':<10} {'状态'}")
+        print("-" * 84)
+
+        for idx, lf in enumerate(log_files, 1):
+            brief = _parse_log_brief(lf)
+            started = brief["started"]
+            if len(started) > 5 and started[4] == "-":
+                started = started[5:]  # 去掉年份前缀
+            print(f"  {idx:<4} {started:<22} {brief['command']:<12} "
+                  f"{brief['executor']:<10} {brief['duration']:<10} {brief['status']}")
+
+        print("=" * 84)
+        print()
+        print(f"提示：使用 evo-skills-client status {agent} <N> 查看�� N 条记录详情")
+
+
+def cmd_status():
+    """显示所有角色状态表格。"""
+    # 尝试通过 HTTP API 查询实时状态
+    api_data = query_scheduler_api("/status")
+
+    if api_data:
+        # 成功连接到 scheduler，使用实时数据
+        scheduler_info = api_data.get("scheduler", {})
+        agents_state = api_data.get("agents", {})
+
+        # 显示服务状态
+        pid = scheduler_info.get("pid", "-")
+        started = scheduler_info.get("started_at", "-")
+        uptime = scheduler_info.get("uptime", 0)
+        uptime_str = f"{uptime:.0f}s" if uptime < 3600 else f"{uptime/3600:.1f}h"
+        print(f"【服务】PID: {pid}  启动时间: {started}  运行时长: {uptime_str}")
+        print()
+    else:
+        # 无法连接到 scheduler，读取 state.json（可能是僵尸状态）
+        print("【警告】无法连接到 scheduler 进程，以下状态可能已过期（进程可能已死）")
+        print()
+
+        state_data = {}
+        agents_state = {}
+        if STATE_FILE.exists():
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                state_data = json.load(f)
+            agents_state = state_data.get("agents", {})
+
+            pid = state_data.get("pid", "-")
+            started = state_data.get("started_at", "-")
+            print(f"【服务】PID: {pid} (可能已死)  启动时间: {started}")
+            print()
+
+    # 读取所有配置
+    configs = _load_all_configs()
+
+    if not configs and not agents_state:
+        print("【状态】暂无任何角色配置或状态信息。")
+        return
+
+    # 合并角色列表
+    agents = set()
+    for name in configs:
+        agents.add(name)
+    for name in agents_state:
+        agents.add(name)
+    agents = sorted(agents)
+
+    # 表格输出
+    print("=" * 78)
+    print(f"{'角色名称':<28} {'执行器':<10} {'任务数':<8} {'状态':<10} {'最后运行':<20}")
+    print("-" * 78)
+    for agent in agents:
+        cfg = configs.get(agent, {})
+        agent_info = cfg.get("agent", {}) if isinstance(cfg.get("agent"), dict) else {}
+        executor = agent_info.get("executor", "-")
+        schedules = cfg.get("schedules", [])
+        n_tasks = len(schedules) if isinstance(schedules, list) else 0
+
+        # 状态信息
+        agent_state = agents_state.get(agent, {})
+        if isinstance(agent_state, dict):
+            last_run = agent_state.get("last_run", "-")
+            status = agent_state.get("status", "未启动")
+
+            # 如果有 running_elapsed，说明正在运行
+            if "running_elapsed" in agent_state:
+                elapsed = agent_state["running_elapsed"]
+                status = f"运行中 ({elapsed:.0f}s)"
+        else:
+            last_run = "-"
+            status = "未启动"
+
+        print(f"  {agent:<26} {executor:<10} {n_tasks:<8} {status:<10} {last_run:<20}")
+    print("=" * 78)
+    print(f"  共 {len(agents)} 个角色")
+
+
+def cmd_history(agent: str):
+    """列出某角色的唤醒历史。"""
+    agent_log_dir = LOGS_DIR / agent
+    if not agent_log_dir.exists():
+        print(f"【历史】角色 '{agent}' 的日志目录不存在：{agent_log_dir}")
+        print("  可能该角色尚未执行过任何任务。")
+        return
+
+    # 扫描日志文件
+    log_files = sorted(agent_log_dir.iterdir(), reverse=True)
+    if not log_files:
+        print(f"【历史】角色 '{agent}' 暂无唤醒记录。")
+        return
+
+    print(f"【历史】角色 '{agent}' 的唤醒记录（共 {len(log_files)} 条）：")
+    print("-" * 68)
+    print(f"  {'序号':<6} {'时间':<24} {'文件名':<30} {'大小'}")
+    print("-" * 68)
+    for idx, lf in enumerate(log_files, 1):
+        stat = lf.stat()
+        size_kb = stat.st_size / 1024
+        mtime = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+        print(f"  {idx:<6} {mtime:<24} {lf.name:<30} {size_kb:.1f} KB")
+    print("-" * 68)
+
+
+def cmd_detail(agent: str, time_str: str):
+    """显示某次唤醒的详细日志内容。"""
+    agent_log_dir = LOGS_DIR / agent
+    if not agent_log_dir.exists():
+        print(f"【详情】角色 '{agent}' 的日志目录不存在。")
+        return
+
+    # 模糊匹配文件名中包含 time_str 的日志
+    matches = []
+    for lf in sorted(agent_log_dir.iterdir()):
+        if time_str in lf.name:
+            matches.append(lf)
+
+    if not matches:
+        print(f"【详情】未找到匹配 '{time_str}' 的日志文件。")
+        print(f"  提示：使用 'history {agent}' 查看可用的日志记录。")
+        return
+
+    if len(matches) > 1:
+        print(f"【详情】找到 {len(matches)} 个匹配项，显示第一个：")
+
+    target = matches[0]
+    print(f"【详情】角色: {agent}  文件: {target.name}")
+    print("=" * 68)
+    with open(target, "r", encoding="utf-8") as f:
+        print(f.read())
+    print("=" * 68)
+
+
+def cmd_config(agent: str, set_expr: str = None):
+    """显示或修改某角色的调度配置。"""
+    config_file = CONFIGS_DIR / f"{agent}.yaml"
+    if not config_file.exists():
+        print(f"【配置】角色 '{agent}' 的配置文件不存在：{config_file}")
+        return
+
+    if set_expr is None:
+        # 显示配置
+        cfg = load_yaml_file(config_file)
+        agent_info = cfg.get("agent", {})
+        schedules = cfg.get("schedules", [])
+
+        print(f"【配置】角色: {agent_info.get('name', agent)}")
+        print(f"  执行器: {agent_info.get('executor', '-')}")
+
+        # 显示 agent 级权限
+        agent_perms = agent_info.get("permissions", {})
+        if isinstance(agent_perms, dict) and agent_perms:
+            print(f"  权限策略:")
+            pm = agent_perms.get("permission_mode", "")
+            if pm:
+                print(f"    模式: {pm}")
+            at = agent_perms.get("allowed_tools", [])
+            if at and isinstance(at, list):
+                print(f"    工具: {', '.join(str(t) for t in at)}")
+            ad = agent_perms.get("add_dirs", [])
+            if ad and isinstance(ad, list):
+                print(f"    目录: {', '.join(str(d) for d in ad)}")
+        print()
+        print(f"  调度任务（共 {len(schedules)} 项）：")
+        print("  " + "-" * 76)
+        print(f"  {'命令':<12} {'Cron 表达式':<22} {'执行器':<12} {'模型':<14} {'描述'}")
+        print("  " + "-" * 76)
+        for s in schedules:
+            if isinstance(s, dict):
+                cmd = s.get("command", "-")
+                cron = s.get("cron", "-")
+                desc = s.get("description", "-")
+                s_exec = s.get("executor", "")
+                s_model = s.get("model", "")
+                exec_display = s_exec if s_exec else "(默认)"
+                model_display = s_model if s_model else "(默认)"
+                print(f"  {cmd:<12} {cron:<22} {exec_display:<12} {model_display:<14} {desc}")
+        print("  " + "-" * 76)
+    else:
+        # 修改配置：解析 "<command>.<field>=<value>"
+        # 支持的字段：cron, executor, model
+        valid_fields = ("cron", "executor", "model")
+        parsed_field = None
+        for field in valid_fields:
+            marker = f".{field}="
+            if marker in set_expr:
+                target_cmd, new_value = set_expr.split(marker, 1)
+                target_cmd = target_cmd.strip()
+                new_value = new_value.strip()
+                parsed_field = field
+                break
+
+        if not parsed_field:
+            print("【错误】--set 格式应为：\"<command>.<field>=<value>\"")
+            print(f"  支持的字段：{', '.join(valid_fields)}")
+            print('  例如：--set "learn.cron=0 6 * * *"')
+            print('  例如：--set "learn.executor=opencode"')
+            print('  例如：--set "learn.model=gemini-2.5-pro"')
+            return
+
+        # 读取原始文件内容进行文本替换（保留注释和格式）
+        with open(config_file, "r", encoding="utf-8") as f:
+            original = f.read()
+
+        cfg = parse_yaml(original)
+        schedules = cfg.get("schedules", [])
+
+        # 找到目标命令
+        found = False
+        old_value = ""
+        for s in schedules:
+            if isinstance(s, dict) and s.get("command") == target_cmd:
+                old_value = s.get(parsed_field, "")
+                found = True
+                break
+
+        if not found:
+            print(f"【错误】在 '{agent}' 的配置中未找到命令 '{target_cmd}'。")
+            print(f"  可用命令：{', '.join(s.get('command', '?') for s in schedules if isinstance(s, dict))}")
+            return
+
+        # 文本替换（保留格式）
+        # 查找 command: <target_cmd> 后面最近的 <field>: 行进行替换
+        lines = original.splitlines()
+        in_target_block = False
+        modified = False
+        new_lines = []
+
+        for line in lines:
+            stripped = line.strip()
+
+            # 检测是否进入目标命令块
+            if stripped.startswith("- command:") and target_cmd in stripped:
+                in_target_block = True
+                new_lines.append(line)
+                continue
+
+            # 如果遇到下一个列表项或同级键，退出目标块
+            if in_target_block and stripped.startswith("- "):
+                # 如果是新字段（executor/model），在退出块前插入
+                if not modified and parsed_field != "cron":
+                    # 需要添加新字段行
+                    # 计算缩进（与 cron/description 同级）
+                    prev_indent = "    "
+                    for prev_line in reversed(new_lines):
+                        ps = prev_line.strip()
+                        if ps.startswith("cron:") or ps.startswith("description:"):
+                            prev_indent = prev_line[:len(prev_line) - len(prev_line.lstrip())]
+                            break
+                    quote = '"' if ' ' in new_value or any(c in new_value for c in ':#') else ''
+                    new_lines.append(f'{prev_indent}{parsed_field}: {quote}{new_value}{quote}')
+                    modified = True
+                in_target_block = False
+
+            # 在目标块中找到对应字段行并替换
+            if in_target_block and stripped.startswith(f"{parsed_field}:") and not modified:
+                indent = line[:len(line) - len(line.lstrip())]
+                quote = '"' if ' ' in new_value or any(c in new_value for c in ':#') else ''
+                new_lines.append(f'{indent}{parsed_field}: {quote}{new_value}{quote}')
+                modified = True
+                continue
+
+            new_lines.append(line)
+
+        # 如果目标块是最后一个且未找到字段，追加新字段
+        if in_target_block and not modified and parsed_field != "cron":
+            prev_indent = "    "
+            for prev_line in reversed(new_lines):
+                ps = prev_line.strip()
+                if ps.startswith("cron:") or ps.startswith("description:"):
+                    prev_indent = prev_line[:len(prev_line) - len(prev_line.lstrip())]
+                    break
+            quote = '"' if ' ' in new_value or any(c in new_value for c in ':#') else ''
+            new_lines.append(f'{prev_indent}{parsed_field}: {quote}{new_value}{quote}')
+            modified = True
+
+        if modified:
+            with open(config_file, "w", encoding="utf-8") as f:
+                f.write("\n".join(new_lines))
+                if original.endswith("\n"):
+                    f.write("\n")
+            print(f"【配置已更新】角色: {agent}")
+            print(f"  命令: {target_cmd}")
+            print(f"  字段: {parsed_field}")
+            print(f"  旧值: {old_value or '(未设置)'}")
+            print(f"  新值: {new_value}")
+        else:
+            print("【错误】替换失败，请检查配置文件格式。")
+
+
+def cmd_config_add(agent: str, command: str, cron_expr: str, description: str,
+                   executor: str = "", model: str = ""):
+    """向角色配置中添加新的调度项。"""
+    config_file = CONFIGS_DIR / f"{agent}.yaml"
+    if not config_file.exists():
+        print(f"【配置】角色 '{agent}' 的配置文件不存在：{config_file}")
+        return
+
+    with open(config_file, "r", encoding="utf-8") as f:
+        original = f.read()
+
+    # 检查命令是否已存在
+    cfg = parse_yaml(original)
+    schedules = cfg.get("schedules", [])
+    for s in schedules:
+        if isinstance(s, dict) and s.get("command") == command:
+            print(f"【错误】命令 '{command}' 已存在于 '{agent}' 的调度配置中。")
+            print(f"  如需修改，请使用 --set \"{command}.cron=...\"")
+            return
+
+    # 构造新的 schedule 项
+    lines = [
+        f'  - command: {command}',
+        f'    cron: "{cron_expr}"',
+        f'    description: "{description}"',
+    ]
+    if executor:
+        lines.append(f'    executor: {executor}')
+    if model:
+        lines.append(f'    model: {model}')
+
+    new_block = "\n".join(lines)
+
+    # 追加到文件末尾
+    content = original.rstrip("\n") + "\n\n" + new_block + "\n"
+    with open(config_file, "w", encoding="utf-8") as f:
+        f.write(content)
+
+    print(f"【配置已添加】角色: {agent}")
+    print(f"  命令: {command}")
+    print(f"  Cron: {cron_expr}")
+    print(f"  描述: {description}")
+    if executor:
+        print(f"  执行器: {executor}")
+    if model:
+        print(f"  模型: {model}")
+
+
+def cmd_config_remove(agent: str, command: str):
+    """从角色配置中移除指定命令的调度项。"""
+    config_file = CONFIGS_DIR / f"{agent}.yaml"
+    if not config_file.exists():
+        print(f"【配置】角色 '{agent}' 的配置文件不存在：{config_file}")
+        return
+
+    with open(config_file, "r", encoding="utf-8") as f:
+        original = f.read()
+
+    lines = original.splitlines()
+    new_lines = []
+    skip_block = False
+    removed = False
+    i = 0
+
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+
+        # 检测列表项开头
+        if stripped.startswith("- command:") and command in stripped:
+            # 找到目标命令，跳过整个块
+            skip_block = True
+            removed = True
+            i += 1
+            # 跳过后续缩进行（属于同一列表项）
+            while i < len(lines):
+                next_stripped = lines[i].strip()
+                if not next_stripped or next_stripped.startswith("#"):
+                    i += 1
+                    continue
+                next_indent = len(lines[i]) - len(lines[i].lstrip())
+                item_indent = len(line) - len(line.lstrip())
+                if next_indent > item_indent and not next_stripped.startswith("- "):
+                    i += 1
+                else:
+                    break
+            skip_block = False
+            continue
+
+        if not skip_block:
+            new_lines.append(line)
+        i += 1
+
+    if removed:
+        with open(config_file, "w", encoding="utf-8") as f:
+            f.write("\n".join(new_lines))
+            if original.endswith("\n"):
+                f.write("\n")
+        print(f"【配置已移除】角色: {agent}")
+        print(f"  命令: {command}")
+    else:
+        print(f"【错误】在 '{agent}' 的配置中未找到命令 '{command}'。")
+
+
+# ===========================================================================
+# 工具函数
+# ===========================================================================
+
+def _load_all_configs() -> dict:
+    """加载 configs/ 下所有 .yaml 配置，返回 {agent_name: config_dict}。"""
+    result = {}
+    if not CONFIGS_DIR.exists():
+        return result
+    for f in sorted(CONFIGS_DIR.iterdir()):
+        if f.suffix in (".yaml", ".yml"):
+            try:
+                cfg = load_yaml_file(f)
+                name = f.stem
+                if isinstance(cfg.get("agent"), dict):
+                    name = cfg["agent"].get("name", f.stem)
+                result[name] = cfg
+            except Exception as e:
+                print(f"  警告：解析 {f.name} 失败：{e}", file=sys.stderr)
+    return result
+
+
+def print_usage():
+    print("evo-skills-client — Evo Skills 调度系统客户端")
+    print()
+    print("用法：")
+    print("  evo-skills-client status                                 显示所有角色状态")
+    print("  evo-skills-client status <agent>                         显示角色唤醒清单")
+    print("  evo-skills-client status <agent> <N>                     显示倒数第 N 条唤醒详情")
+    print("  evo-skills-client status <agent> <N> --full              显示完整输出（不截断）")
+    print("  evo-skills-client history <agent>                        列出角色唤醒历史")
+    print("  evo-skills-client detail <agent> <time>                  查看唤醒详细日志")
+    print("  evo-skills-client config <agent>                         显示角色调度配置")
+    print('  evo-skills-client config <agent> --set "<cmd>.<field>=<value>"  修改配置')
+    print('  evo-skills-client config <agent> --add <cmd> --cron "<expr>" --description "<desc>"')
+    print('                                       [--executor <exec>] [--model <model>]  添加调度')
+    print('  evo-skills-client config <agent> --remove <cmd>          移除调度')
+    print()
+    print("  支持的 --set 字段：cron, executor, model")
+    print()
+    print("示例：")
+    print("  evo-skills-client status")
+    print("  evo-skills-client history greate-stocks-operator")
+    print("  evo-skills-client config evo-skill-creator")
+    print('  evo-skills-client config evo-skill-creator --set "learn.cron=0 6 * * *"')
+    print('  evo-skills-client config evo-skill-creator --add review --cron "0 17 * * 5" --description "周五自省"')
+    print('  evo-skills-client config evo-skill-creator --remove review')
+
+
+# ===========================================================================
+# 主入口
+# ===========================================================================
+
+def main():
+    args = sys.argv[1:]
+
+    if not args or args[0] in ("-h", "--help", "help"):
+        print_usage()
+        sys.exit(0)
+
+    command = args[0]
+
+    if command == "status":
+        if len(args) >= 2 and not args[1].startswith("-"):
+            agent_arg = args[1]
+            full_flag = "--full" in args
+            # 检查是否有数字参数 (status xxx N)
+            n_arg = None
+            for a in args[2:]:
+                if a.isdigit():
+                    n_arg = int(a)
+                    break
+            cmd_status_agent(agent_arg, n=n_arg, full=full_flag)
+        else:
+            cmd_status()
+
+    elif command == "history":
+        if len(args) < 2:
+            print("【错误】请指定角色名称。用法：evo-skills-client history <agent>")
+            sys.exit(1)
+        cmd_history(args[1])
+
+    elif command == "detail":
+        if len(args) < 3:
+            print("【错误】请指定角色名称和时间。用法：evo-skills-client detail <agent> <time>")
+            sys.exit(1)
+        cmd_detail(args[1], args[2])
+
+    elif command == "config":
+        if len(args) < 2:
+            print("【错误】请指定角色名称。用法：evo-skills-client config <agent>")
+            sys.exit(1)
+        agent = args[1]
+
+        if "--add" in args:
+            # config <agent> --add <command> --cron <expr> --description <desc>
+            #   [--executor <exec>] [--model <model>]
+            add_idx = args.index("--add")
+            if add_idx + 1 >= len(args):
+                print("【错误】--add 后需要指定命令名。")
+                sys.exit(1)
+            add_cmd = args[add_idx + 1]
+            cron_expr = ""
+            desc = ""
+            exec_val = ""
+            model_val = ""
+            if "--cron" in args:
+                ci = args.index("--cron")
+                cron_expr = args[ci + 1] if ci + 1 < len(args) else ""
+            if "--description" in args:
+                di = args.index("--description")
+                desc = args[di + 1] if di + 1 < len(args) else ""
+            if "--executor" in args:
+                ei = args.index("--executor")
+                exec_val = args[ei + 1] if ei + 1 < len(args) else ""
+            if "--model" in args:
+                mi = args.index("--model")
+                model_val = args[mi + 1] if mi + 1 < len(args) else ""
+            if not cron_expr:
+                print("【错误】--add 需要 --cron 参数。")
+                sys.exit(1)
+            cmd_config_add(agent, add_cmd, cron_expr, desc or add_cmd,
+                           exec_val, model_val)
+
+        elif "--remove" in args:
+            rm_idx = args.index("--remove")
+            if rm_idx + 1 >= len(args):
+                print("【错误】--remove 后需要指定命令名。")
+                sys.exit(1)
+            cmd_config_remove(agent, args[rm_idx + 1])
+
+        elif "--set" in args:
+            set_idx = args.index("--set")
+            if set_idx + 1 < len(args):
+                set_expr = args[set_idx + 1]
+            else:
+                print("【错误】--set 后需要指定表达式。")
+                sys.exit(1)
+            cmd_config(agent, set_expr)
+
+        else:
+            cmd_config(agent)
+
+    else:
+        print(f"【错误】未知命令：{command}")
+        print()
+        print_usage()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

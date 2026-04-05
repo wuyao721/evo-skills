@@ -1,0 +1,22 @@
+# 运行时文件
+scheduler/logs/
+scheduler/state.json
+scheduler/state.json.tmp
+scheduler/__pycache__/
+
+# 智能体数据（每个用户自己的）
+skills/*/memory/private/
+skills/*/output/
+skills/*/.claude/
+
+# 用户配置（包含个人路径）
+scheduler/configs/*.yaml
+scheduler/configs/*.yaml.disabled
+!scheduler/configs/example.yaml
+
+# 系统文件
+.DS_Store
+*.pyc
+
+# IDE/工具配置（包含个人路径）
+.claude/
